@@ -823,7 +823,7 @@ def irrigation_process(
     print("[Sample] Sampling irrigated/rainfed pixels (agriculture only)...")
     X_irrig, y_irrig = _sample_from_polygons(
         gdf=gdf_local,
-        raster_path=out_masked_tif,
+        raster_path=comp_tif,
         bands_count=len(bands),
         show_progress=show_progress,
         max_pixels_per_poly=max_pixels_per_poly,
