@@ -1043,3 +1043,150 @@ def export_classification_summary(
     print(area_df.to_string(index=False))
 
     return area_csv_path
+
+import os
+import numpy as np
+import xarray as xr
+import geopandas as gpd
+import rioxarray
+import s3fs
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from rasterio.enums import Resampling
+
+def compare_map(
+    other_map_path_or_url: str,
+    aoi_path: str = None,
+    iwmi_url_or_path: str = None,           # if None, auto-pick first IWMI COG from S3
+    iwmi_bucket_prefix: str = "iwmi-datasets/Cropland_partition/Irrigated_area",
+    resampling_for_align: str = "nearest",   # 'nearest' for classes; 'bilinear' for continuous
+    class_info_pred: dict = None,            # e.g., {0:("Other","#fff"), 1:("Irrigated","#682215"), 2:("Rainfed","#eaf30c")}
+    class_info_iwmi: dict = None,            # e.g., {0:("Irrigated","#682215"), 1:("Rainfed","#eaf30c")}
+    title_iwmi: str = "IWMI Classified Map",
+    title_pred: str = "Predicted Classified Map",
+    sharey: bool = True,
+    out_dir: str = "Results",
+    out_iwmi_name: str = "iwmi_aligned_clip.tif",
+    out_pred_name: str = "pred_aligned_clip.tif"
+):
+    """
+    """
+
+    # ------------- helpers defined inline (kept inside this single function) -------------
+    def list_iwmi_urls(prefix):
+        fs = s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": "af-south-1"})
+        tifs = fs.glob(f"{prefix}/**/*.tif")
+        return [f"https://{t.replace('iwmi-datasets/', 'iwmi-datasets.s3.af-south-1.amazonaws.com/')}" for t in tifs]
+
+    def load_da(path_or_url):
+        return xr.open_dataarray(path_or_url, engine="rasterio")
+
+    def single_band(r):
+        return r.isel(band=0) if "band" in r.dims else r
+
+    def clip_to_aoi(da, aoi):
+        gdf = gpd.read_file(aoi)
+        gdf = gdf.to_crs(da.rio.crs)
+        return da.rio.clip(gdf.geometry, crs=gdf.crs, drop=True, invert=False)
+
+    def align_to(ref, src, resampling="nearest"):
+        method = {"nearest": Resampling.nearest, "bilinear": Resampling.bilinear, "cubic": Resampling.cubic}.get(resampling, Resampling.nearest)
+        aligned = src.rio.reproject_match(ref, resampling=method)
+        return aligned.rio.write_crs(ref.rio.crs)
+
+    def to_int_safe(da):
+        r = single_band(da)
+        v = r.values.copy()
+        nan_mask = np.isnan(v)
+        v_int = np.where(nan_mask, 0, np.rint(v)).astype(np.int32)
+        v_int = np.where(nan_mask, np.nan, v_int)
+        out = r.copy(deep=True); out.values = v_int
+        out = out.rio.write_crs(r.rio.crs).rio.write_nodata(np.nan)
+        return out
+
+    def merge_class_info(info1, info2):
+        merged = {}
+        if info1:
+            merged.update(info1)
+        # if info2:
+        #     merged.update(info2)
+        return merged
+
+    def build_cmap_norm(class_info):
+        keys = sorted(class_info.keys())
+        labels = [class_info[k][0] for k in keys]
+        colors = [class_info[k][1] for k in keys]
+        cmap = plt.matplotlib.colors.ListedColormap(colors)
+        bounds = np.array(keys + [keys[-1] + 1]) - 0.5
+        norm = plt.matplotlib.colors.BoundaryNorm(bounds, cmap.N)
+        patches = [mpatches.Patch(color=c, label=l) for l, c in zip(labels, colors)]
+        return cmap, norm, patches
+
+    # ------------- load IWMI & OTHER -------------
+    if iwmi_url_or_path is None:
+        urls = list_iwmi_urls(iwmi_bucket_prefix)
+        if not urls:
+            raise RuntimeError("No IWMI GeoTIFFs found in the S3 prefix. Provide iwmi_url_or_path explicitly.")
+        iwmi_url_or_path = urls[0]
+
+    iwmi = load_da(iwmi_url_or_path)
+    pred = load_da(other_map_path_or_url)
+
+    # ------------- optional AOI clip -------------
+    if aoi_path:
+        iwmi = clip_to_aoi(iwmi, aoi_path)
+        pred = clip_to_aoi(pred, aoi_path)
+
+    # ------------- align to same grid/units -------------
+    # Choose the predicted map as reference grid (you can invert if needed)
+    iwmi_aligned = align_to(pred, iwmi, resampling=resampling_for_align)
+    pred_aligned = single_band(pred)  # ensure single-band for plotting & int conversion
+
+    # ------------- convert to safe integers (keep NaNs) -------------
+    iwmi_int = to_int_safe(iwmi_aligned)
+    pred_int = to_int_safe(pred_aligned)
+
+    # ------------- build ONE merged legend -------------
+    merged_info = merge_class_info(class_info_iwmi or {}, class_info_pred or {})
+    if not merged_info:
+        # default fallback if none provided
+        merged_info = {0: ("Class 0", "#cccccc"), 1: ("Class 1", "#682215"), 2: ("Class 2", "#eaf30c")}
+    cmap, norm, patches = build_cmap_norm(merged_info)
+
+    # ------------- plot side-by-side with one legend -------------
+    fig, axes = plt.subplots(1, 2, figsize=(13, 6), sharey=sharey)
+    im1 = iwmi_int.plot(ax=axes[0], cmap=cmap, norm=norm, add_colorbar=False)
+    im2 = pred_int.plot(ax=axes[1], cmap=cmap, norm=norm, add_colorbar=False)
+    axes[0].set_title(title_iwmi, fontsize=12)
+    axes[1].set_title(title_pred, fontsize=12)
+    fig.legend(handles=patches, loc='lower center', ncol=min(len(patches), 5),
+               bbox_to_anchor=(0.5, -0.03), frameon=False)
+    plt.tight_layout()
+    plt.savefig(f'{out_dir}/compare_map.png')
+    plt.show()
+
+    return {
+        "iwmi_int": iwmi_int,
+        "pred_int": pred_int,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
