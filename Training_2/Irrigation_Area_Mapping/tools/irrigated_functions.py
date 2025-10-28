@@ -1108,8 +1108,8 @@ def compare_map(
         merged = {}
         if info1:
             merged.update(info1)
-        # if info2:
-        #     merged.update(info2)
+        if info2:
+            merged.update(info2)
         return merged
 
     def build_cmap_norm(class_info):
@@ -1153,13 +1153,25 @@ def compare_map(
         merged_info = {0: ("Class 0", "#cccccc"), 1: ("Class 1", "#682215"), 2: ("Class 2", "#eaf30c")}
     cmap, norm, patches = build_cmap_norm(merged_info)
 
+    # Build filtered, deduplicated legend (only Irrigated + Rainfed)
+    desired_labels = {"Irrigated Agriculture", "Rainfed Agriculture"}
+    
+    # Keep only these from the merged patches
+    filtered_patches = []
+    seen = set()
+    for p in patches:
+        label = p.get_label()
+        if label in desired_labels and label not in seen:
+            filtered_patches.append(p)
+            seen.add(label)
+
     # ------------- plot side-by-side with one legend -------------
     fig, axes = plt.subplots(1, 2, figsize=(13, 6), sharey=sharey)
     im1 = iwmi_int.plot(ax=axes[0], cmap=cmap, norm=norm, add_colorbar=False)
     im2 = pred_int.plot(ax=axes[1], cmap=cmap, norm=norm, add_colorbar=False)
     axes[0].set_title(title_iwmi, fontsize=12)
     axes[1].set_title(title_pred, fontsize=12)
-    fig.legend(handles=patches, loc='lower center', ncol=min(len(patches), 5),
+    fig.legend(handles=filtered_patches, loc='lower center', ncol=min(len(patches), 5),
                bbox_to_anchor=(0.5, -0.03), frameon=False)
     plt.tight_layout()
     plt.savefig(f'{out_dir}/compare_map.png')
